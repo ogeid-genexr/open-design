@@ -167,6 +167,8 @@ export const uk: Dict = {
   'promptTemplates.allSources': 'Усі джерела',
   'promptTemplates.sourceFilterAria': 'Фільтрувати за джерелом',
   'promptTemplates.retry': 'Повторити',
+  'promptTemplates.allSources': 'Усі джерела',
+  'promptTemplates.sourceFilterAria': 'Фільтр за джерелом',
 
   'connectors.title': 'Конектори',
   'connectors.subtitle': 'Локальні та майбутні джерела даних, які можуть живити live-артефакти.',
