@@ -259,6 +259,65 @@ describe('loadConfig', () => {
     expect(config.configMigrationVersion).toBe(1);
   });
 
+  it('migrates legacy Ollama Cloud configs to an explicit ollama apiProtocol', () => {
+    const legacyConfig: Partial<AppConfig> = {
+      mode: 'api',
+      apiKey: 'ollama-key',
+      baseUrl: 'https://ollama.com',
+      model: 'gpt-oss:120b',
+      agentId: null,
+      skillId: null,
+      designSystemId: null,
+    };
+    store.set('open-design:config', JSON.stringify(legacyConfig));
+
+    const config = loadConfig();
+
+    expect(config.mode).toBe('api');
+    expect(config.baseUrl).toBe('https://ollama.com');
+    expect(config.model).toBe('gpt-oss:120b');
+    expect(config.apiProtocol).toBe('ollama');
+    expect(config.apiProviderBaseUrl).toBe('https://ollama.com');
+    expect(config.configMigrationVersion).toBe(1);
+  });
+
+  it('migrates legacy ollama.com configs with a custom base URL path', () => {
+    const legacyConfig: Partial<AppConfig> = {
+      mode: 'api',
+      apiKey: 'ollama-key',
+      baseUrl: 'https://ollama.com/api',
+      model: 'deepseek-v4-pro',
+      agentId: null,
+      skillId: null,
+      designSystemId: null,
+    };
+    store.set('open-design:config', JSON.stringify(legacyConfig));
+
+    const config = loadConfig();
+
+    expect(config.apiProtocol).toBe('ollama');
+    // /api suffix must be stripped so the daemon doesn't build /api/api/chat.
+    expect(config.baseUrl).toBe('https://ollama.com');
+  });
+
+  it('migrates legacy ollama.com configs with a trailing /api/ suffix', () => {
+    const legacyConfig: Partial<AppConfig> = {
+      mode: 'api',
+      apiKey: 'ollama-key',
+      baseUrl: 'https://ollama.com/api/',
+      model: 'glm-5',
+      agentId: null,
+      skillId: null,
+      designSystemId: null,
+    };
+    store.set('open-design:config', JSON.stringify(legacyConfig));
+
+    const config = loadConfig();
+
+    expect(config.apiProtocol).toBe('ollama');
+    expect(config.baseUrl).toBe('https://ollama.com');
+  });
+
   it('does not overwrite an already explicit apiProtocol', () => {
     const explicitConfig: Partial<AppConfig> = {
       mode: 'api',

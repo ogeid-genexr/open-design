@@ -155,6 +155,47 @@ const SUGGESTED_MODELS_BY_PROTOCOL = {
     'MiniMax-M2',
     'mimo-v2.5-pro',
   ],
+  ollama: [
+    'cogito-2.1:671b',
+    'deepseek-v3.1:671b',
+    'deepseek-v3.2',
+    'deepseek-v4-flash',
+    'deepseek-v4-pro',
+    'devstral-2:123b',
+    'devstral-small-2:24b',
+    'gemini-3-flash-preview',
+    'gemma3:4b',
+    'gemma3:12b',
+    'gemma3:27b',
+    'gemma4:31b',
+    'glm-4.6',
+    'glm-4.7',
+    'glm-5',
+    'glm-5.1',
+    'gpt-oss:20b',
+    'gpt-oss:120b',
+    'kimi-k2:1t',
+    'kimi-k2-thinking',
+    'kimi-k2.5',
+    'kimi-k2.6',
+    'minimax-m2',
+    'minimax-m2.1',
+    'minimax-m2.5',
+    'minimax-m2.7',
+    'ministral-3:3b',
+    'ministral-3:8b',
+    'ministral-3:14b',
+    'mistral-large-3:675b',
+    'nemotron-3-nano:30b',
+    'nemotron-3-super',
+    'qwen3-coder:480b',
+    'qwen3-coder-next',
+    'qwen3-next:80b',
+    'qwen3-vl:235b',
+    'qwen3-vl:235b-instruct',
+    'qwen3.5:397b',
+    'rnj-1:8b',
+  ],
   azure: [
     'gpt-4o',
     'gpt-4o-mini',
@@ -175,6 +216,7 @@ const API_PROTOCOL_TABS: Array<{
   { id: 'openai', title: 'OpenAI' },
   { id: 'azure', title: 'Azure OpenAI' },
   { id: 'google', title: 'Google Gemini' },
+  { id: 'ollama', title: 'Ollama Cloud' },
 ];
 
 const API_PROTOCOL_LABELS: Record<ApiProtocol, string> = {
@@ -182,6 +224,7 @@ const API_PROTOCOL_LABELS: Record<ApiProtocol, string> = {
   openai: 'OpenAI API',
   azure: 'Azure OpenAI',
   google: 'Google Gemini',
+  ollama: 'Ollama Cloud API',
 };
 
 const API_KEY_PLACEHOLDERS: Record<ApiProtocol, string> = {
@@ -189,6 +232,7 @@ const API_KEY_PLACEHOLDERS: Record<ApiProtocol, string> = {
   openai: 'sk-...',
   azure: 'azure key',
   google: 'AIza...',
+  ollama: 'Ollama API key',
 };
 
 type RescanNotice =
