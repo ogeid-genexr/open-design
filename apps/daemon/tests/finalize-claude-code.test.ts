@@ -16,7 +16,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   callClaudeCodeCLI,
-  CLAUDE_CODE_EMPTY_TOOL_ALLOWLIST,
+  CLAUDE_CODE_EMPTY_TOOL_SET,
   FinalizeClaudeCodeNotInstalledError,
   probeClaudeCodeCli,
 } from '../src/finalize-claude-code.js';
@@ -151,7 +151,7 @@ describe('callClaudeCodeCLI', () => {
     expect(capturedArgs).toContain('claude-opus-4-7');
   });
 
-  it('passes --allowedTools with an empty value so synthesis runs cannot launch any tool', async () => {
+  it('passes --tools with an empty value so synthesis runs cannot launch any tool', async () => {
     let capturedArgs: readonly string[] = [];
     const spawnImpl = makeSpawn((_cmd, args) => {
       capturedArgs = args;
@@ -175,15 +175,17 @@ describe('callClaudeCodeCLI', () => {
       transport: { spawnImpl: spawnImpl as any },
     });
 
-    const flagIdx = capturedArgs.indexOf('--allowedTools');
+    const flagIdx = capturedArgs.indexOf('--tools');
     expect(flagIdx).toBeGreaterThanOrEqual(0);
-    expect(capturedArgs[flagIdx + 1]).toBe(CLAUDE_CODE_EMPTY_TOOL_ALLOWLIST);
+    expect(capturedArgs[flagIdx + 1]).toBe(CLAUDE_CODE_EMPTY_TOOL_SET);
     expect(capturedArgs[flagIdx + 1]).toBe('');
-    // An empty allowlist is the contract: no enumerated denylist
-    // should be present, since the whole point of switching away from
-    // `--disallowedTools` is that hand-maintained denylists leak any
-    // tool we forget to name (installed built-ins, MCP tools, etc.).
+    // An empty `--tools` value is the contract: no enumerated denylist
+    // should be present, since hand-maintained denylists leak any tool
+    // we forget to name (installed built-ins, MCP tools, etc.).
+    // `--allowedTools` is a permission allowlist and does not replace
+    // the built-in tool surface, so it must not be used here either.
     expect(capturedArgs).not.toContain('--disallowedTools');
+    expect(capturedArgs).not.toContain('--allowedTools');
   });
 
   it('threads maxTokens into the child env as CLAUDE_CODE_MAX_OUTPUT_TOKENS', async () => {

@@ -60,16 +60,18 @@ const VERSION_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_CLAUDE_CODE_TIMEOUT_MS = 600_000;
 
 /**
- * Empty allowlist literal passed to `--allowedTools` so the synthesis
- * run has zero tool surface regardless of which built-in tools the
- * installed CLI version ships or which MCP servers / configured tools
- * the user has wired up. The synthesis prompt is self-contained — all
- * transcript, design system, and artifact context is in stdin — so the
- * provider never needs a tool.
+ * Empty value passed to `--tools` so the synthesis run has zero
+ * built-in tool surface regardless of which tools the installed CLI
+ * version ships or which MCP servers / configured tools the user has
+ * wired up. `--tools` is Claude Code's documented switch for
+ * constraining the built-in tool set; `--allowedTools` is a permission
+ * allowlist and does not replace the built-in surface. The synthesis
+ * prompt is self-contained — all transcript, design system, and
+ * artifact context is in stdin — so the provider never needs a tool.
  *
  * Exported so tests can assert the argv contract.
  */
-export const CLAUDE_CODE_EMPTY_TOOL_ALLOWLIST = '' as const;
+export const CLAUDE_CODE_EMPTY_TOOL_SET = '' as const;
 
 /**
  * The local Claude Code CLI is not installed (or not on PATH the
@@ -254,14 +256,15 @@ export async function callClaudeCodeCLI(input: {
     // already in the user prompt. Pass an empty allowlist so the CLI
     // runs with zero tool surface regardless of which built-in tools
     // ship in the installed version or which MCP / configured tools
-    // the user has wired up. This is the inverse of an enumerated
-    // denylist: a denylist leaks any tool we forgot to name, an empty
-    // allowlist leaks nothing. `--permission-mode default` alone does
-    // NOT disable tools; it only controls how permission prompts are
-    // surfaced. The combination keeps the CLI in a pure
+    // the user has wired up. `--tools` is Claude Code's documented
+    // switch for constraining the built-in tool set; passing an empty
+    // value disables all of them. `--allowedTools` is a permission
+    // allowlist and does NOT replace the built-in surface, and
+    // `--permission-mode default` alone only controls how permission
+    // prompts are surfaced. The combination keeps the CLI in a pure
     // prompt-completion shape.
-    '--allowedTools',
-    CLAUDE_CODE_EMPTY_TOOL_ALLOWLIST,
+    '--tools',
+    CLAUDE_CODE_EMPTY_TOOL_SET,
     '--permission-mode',
     'default',
   ];
