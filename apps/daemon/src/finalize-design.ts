@@ -408,14 +408,27 @@ export async function runFinalizeWithSynthesizer(
     const timeoutController = new AbortController();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
+    const composedSignal = options.signal
+      ? AbortSignal.any([options.signal, timeoutController.signal])
+      : timeoutController.signal;
     let synthesis: FinalizeSynthesisResult;
     try {
-      const composedSignal = options.signal
-        ? AbortSignal.any([options.signal, timeoutController.signal])
-        : timeoutController.signal;
       synthesis = await synthesize({ systemPrompt, userPrompt, signal: composedSignal });
     } finally {
       clearTimeout(timeoutId);
+    }
+
+    // Eager lock release on abort hands the lockfile to a retry the
+    // instant a cancel arrives, but a late-settling synthesizer can
+    // still resolve after that point. Without this guard, the canceled
+    // run would proceed into the phase-9 rename and overwrite the
+    // retry's newer DESIGN.md (last-writer-wins). Re-check the composed
+    // signal before any filesystem mutation so canceled invocations
+    // exit through the AbortError path instead of writing output.
+    if (composedSignal.aborted) {
+      const aborted = new Error('aborted');
+      aborted.name = 'AbortError';
+      throw aborted;
     }
 
     // Phase 9: atomic write. Mirror PR #493: writeFileSync({flag:'wx'}) →

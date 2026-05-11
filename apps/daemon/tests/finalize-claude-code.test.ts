@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   callClaudeCodeCLI,
+  CLAUDE_CODE_BUILTIN_TOOLS,
   FinalizeClaudeCodeNotInstalledError,
   probeClaudeCodeCli,
 } from '../src/finalize-claude-code.js';
@@ -148,6 +149,99 @@ describe('callClaudeCodeCLI', () => {
     expect(capturedArgs).toContain('stream-json');
     expect(capturedArgs).toContain('--model');
     expect(capturedArgs).toContain('claude-opus-4-7');
+  });
+
+  it('passes --disallowedTools listing every built-in tool so synthesis runs cannot touch the project cwd', async () => {
+    let capturedArgs: readonly string[] = [];
+    const spawnImpl = makeSpawn((_cmd, args) => {
+      capturedArgs = args;
+      const child = createFakeChild();
+      setImmediate(() => {
+        child.finish([
+          JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            result: 'ok',
+          }),
+        ]);
+      });
+      return child;
+    });
+
+    await callClaudeCodeCLI({
+      ...promptInput,
+      signal: new AbortController().signal,
+      transport: { spawnImpl: spawnImpl as any },
+    });
+
+    const flagIdx = capturedArgs.indexOf('--disallowedTools');
+    expect(flagIdx).toBeGreaterThanOrEqual(0);
+    const denyList = String(capturedArgs[flagIdx + 1] ?? '').split(/\s+/);
+    for (const tool of CLAUDE_CODE_BUILTIN_TOOLS) {
+      expect(denyList).toContain(tool);
+    }
+    // High-risk tools must be in the deny list specifically — these
+    // are the ones whose absence would let synthesis mutate the
+    // user's project from cwd.
+    for (const dangerous of ['Bash', 'Edit', 'Write', 'Read', 'WebFetch']) {
+      expect(denyList).toContain(dangerous);
+    }
+  });
+
+  it('threads maxTokens into the child env as CLAUDE_CODE_MAX_OUTPUT_TOKENS', async () => {
+    let capturedEnv: Record<string, string | undefined> = {};
+    const spawnImpl = ((_cmd: string, _args: readonly string[], opts: any) => {
+      capturedEnv = opts?.env ?? {};
+      const child = createFakeChild();
+      setImmediate(() => {
+        child.finish([
+          JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            result: 'ok',
+          }),
+        ]);
+      });
+      return child;
+    }) as FakeSpawn;
+
+    await callClaudeCodeCLI({
+      ...promptInput,
+      signal: new AbortController().signal,
+      maxTokens: 4096,
+      transport: { spawnImpl: spawnImpl as any },
+    });
+
+    expect(capturedEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('4096');
+  });
+
+  it('omits CLAUDE_CODE_MAX_OUTPUT_TOKENS when maxTokens is unset', async () => {
+    let capturedEnv: Record<string, string | undefined> = {};
+    const spawnImpl = ((_cmd: string, _args: readonly string[], opts: any) => {
+      capturedEnv = opts?.env ?? {};
+      const child = createFakeChild();
+      setImmediate(() => {
+        child.finish([
+          JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            result: 'ok',
+          }),
+        ]);
+      });
+      return child;
+    }) as FakeSpawn;
+
+    await callClaudeCodeCLI({
+      ...promptInput,
+      signal: new AbortController().signal,
+      transport: { spawnImpl: spawnImpl as any },
+    });
+
+    expect(capturedEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBeUndefined();
   });
 
   it('returns null model + token counters when the CLI omits them', async () => {

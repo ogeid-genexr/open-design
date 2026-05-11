@@ -1124,4 +1124,53 @@ describe('runFinalizeWithSynthesizer (eager-release-on-abort)', () => {
 
     await expect(first).rejects.toThrow(/aborted/);
   });
+
+  it('does not write DESIGN.md when the signal aborted before phase-9, even if the synthesizer resolves late', async () => {
+    // Regression guard for the race noted by @mrcfps / Codex on
+    // PR #1279: with eager lock release, a synthesizer that settles
+    // *after* the abort fires must not overwrite a retry's output.
+    // The orchestrator checks `composedSignal.aborted` before the
+    // atomic rename and exits via AbortError instead.
+    const { db, projectsRoot, designSystemsRoot } = setupPipeline();
+    const designMdPath = path.join(projectsRoot, PROJECT_ID, 'DESIGN.md');
+    fs.writeFileSync(designMdPath, '# DESIGN.md\nretry-output\n', 'utf8');
+    const controller = new AbortController();
+
+    const pending = runFinalizeWithSynthesizer(
+      db,
+      projectsRoot,
+      designSystemsRoot,
+      PROJECT_ID,
+      { signal: controller.signal, timeoutMs: 60_000 },
+      // Synthesizer ignores the abort and resolves with stale output
+      // shortly after the caller cancels. Without the phase-9 guard
+      // this body would clobber the retry's DESIGN.md on disk.
+      ({ signal }) =>
+        new Promise((resolve) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              setTimeout(
+                () =>
+                  resolve({
+                    designMd: '# DESIGN.md\nstale-cancelled-output\n',
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    model: null,
+                  }),
+                25,
+              );
+            },
+            { once: true },
+          );
+        }),
+    );
+
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    // Retry's DESIGN.md must survive untouched.
+    expect(fs.readFileSync(designMdPath, 'utf8')).toBe('# DESIGN.md\nretry-output\n');
+  });
 });

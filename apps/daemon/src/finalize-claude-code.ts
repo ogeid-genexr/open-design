@@ -60,6 +60,38 @@ const VERSION_PROBE_TIMEOUT_MS = 5_000;
 const DEFAULT_CLAUDE_CODE_TIMEOUT_MS = 600_000;
 
 /**
+ * Full built-in tool surface of the Claude Code CLI. Passed to
+ * `--disallowedTools` so the synthesis run cannot launch Bash, read
+ * arbitrary files from the project cwd, search the web, etc. The
+ * synthesis prompt is self-contained — all transcript, design
+ * system, and artifact context is in stdin — so this list does not
+ * elide any capability the route genuinely needs.
+ *
+ * Keep in sync with upstream when new built-in tools ship; an unknown
+ * tool name in `--disallowedTools` is harmless, a missing one is a
+ * permission gap.
+ */
+export const CLAUDE_CODE_BUILTIN_TOOLS = [
+  'Bash',
+  'BashOutput',
+  'Edit',
+  'ExitPlanMode',
+  'Glob',
+  'Grep',
+  'KillShell',
+  'LS',
+  'MultiEdit',
+  'NotebookEdit',
+  'Read',
+  'SlashCommand',
+  'Task',
+  'TodoWrite',
+  'WebFetch',
+  'WebSearch',
+  'Write',
+] as const;
+
+/**
  * The local Claude Code CLI is not installed (or not on PATH the
  * daemon can see). Distinct from `FinalizeUpstreamError` so the route
  * handler can return a tailored 503 message instructing the user to
@@ -220,6 +252,7 @@ export async function callClaudeCodeCLI(input: {
   signal: AbortSignal;
   cwd: string;
   model?: string;
+  maxTokens?: number;
   transport?: ClaudeCodeCliTransport;
 }): Promise<FinalizeSynthesisResult> {
   const cliPath = input.transport?.cliPath ?? defaultCliBin();
@@ -236,9 +269,19 @@ export async function callClaudeCodeCLI(input: {
     '--verbose',
     '--append-system-prompt',
     input.systemPrompt,
-    // Synthesis never needs to read project files or run tools — the
-    // entire context is already in the user prompt. Disable tools so
-    // a Max plan user does not see surprising tool-permission prompts.
+    // Synthesis never needs project file access or tool invocations —
+    // the full transcript, design system, and current artifact are
+    // already in the user prompt. The CLI's default config allows the
+    // agent's built-in tool surface (Bash/Edit/Write/Read/Glob/Grep/
+    // WebFetch/WebSearch/Task/TodoWrite/NotebookEdit/MultiEdit/LS/
+    // SlashCommand/BashOutput/KillShell/ExitPlanMode), so we
+    // explicitly deny every one of them. `--permission-mode default`
+    // alone does NOT disable tools; it only controls how permission
+    // prompts are surfaced. The combination here keeps the CLI in a
+    // pure prompt-completion shape and prevents any side-effecting
+    // tool invocation against the user's project directory.
+    '--disallowedTools',
+    CLAUDE_CODE_BUILTIN_TOOLS.join(' '),
     '--permission-mode',
     'default',
   ];
@@ -254,10 +297,21 @@ export async function callClaudeCodeCLI(input: {
     throw err;
   }
 
+  // Claude Code reads its per-response output ceiling from the
+  // `CLAUDE_CODE_MAX_OUTPUT_TOKENS` env var (it has no equivalent
+  // CLI flag). Honoring `maxTokens` here keeps the route's request
+  // contract truthful: a caller that asks for a tighter ceiling
+  // actually gets one, matching the Anthropic provider's behavior.
+  const childEnv = { ...process.env };
+  if (typeof input.maxTokens === 'number' && input.maxTokens > 0) {
+    childEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(Math.trunc(input.maxTokens));
+  }
+
   const spawnOptions: SpawnOptions = {
     cwd: input.cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     signal: input.signal,
+    env: childEnv,
   };
 
   let child: ChildProcess;
@@ -460,6 +514,7 @@ export async function finalizeDesignPackageWithClaudeCode(
       cwd,
     };
     if (options.model) callInput.model = options.model;
+    if (typeof options.maxTokens === 'number') callInput.maxTokens = options.maxTokens;
     if (options.cli) callInput.transport = options.cli;
     return callClaudeCodeCLI(callInput);
   };
