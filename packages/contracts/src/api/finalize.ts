@@ -55,3 +55,38 @@ export interface FinalizeAnthropicResponse {
   transcriptMessageCount: number;
   designSystemId: string | null;
 }
+
+/**
+ * Request body for `POST /api/projects/:id/finalize/claude-code`.
+ *
+ * Auth is delegated to the user's existing Claude Code CLI login
+ * (`claude /login`) so Max plan subscribers do not pay per-token
+ * BYOK API costs for synthesis. Consequently there is no `apiKey`
+ * field. `model` is optional — when omitted, the daemon lets the
+ * CLI pick its configured default.
+ */
+export interface FinalizeClaudeCodeRequest {
+  model?: string;
+  maxTokens?: number;
+}
+
+/**
+ * Response body for `/finalize/claude-code`. Mirrors
+ * `FinalizeAnthropicResponse` except:
+ *   - `model` is nullable: when the request omits `model` and the
+ *     CLI's stream-json result event doesn't surface the model it
+ *     used, the daemon returns `null` rather than guessing.
+ *   - `inputTokens` / `outputTokens` are nullable: the CLI surfaces
+ *     usage in its final `result` event when available, but the
+ *     daemon does not synthesize counts when it isn't.
+ */
+export interface FinalizeClaudeCodeResponse {
+  designMdPath: string;
+  bytesWritten: number;
+  model: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  artifact: FinalizeArtifactRef | null;
+  transcriptMessageCount: number;
+  designSystemId: string | null;
+}

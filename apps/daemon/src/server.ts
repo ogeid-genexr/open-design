@@ -88,6 +88,10 @@ import {
   FinalizePackageLockedError,
   FinalizeUpstreamError,
 } from './finalize-design.js';
+import {
+  finalizeDesignPackageWithClaudeCode,
+  FinalizeClaudeCodeNotInstalledError,
+} from './finalize-claude-code.js';
 import { listPromptTemplates, readPromptTemplate } from './prompt-templates.js';
 import { buildDocumentPreview } from './document-preview.js';
 import { lintArtifact, renderFindingsForAgent } from './lint-artifact.js';
@@ -2769,6 +2773,8 @@ export async function startServer({
   };
   const finalizeDeps = {
     finalizeDesignPackage,
+    finalizeDesignPackageWithClaudeCode,
+    FinalizeClaudeCodeNotInstalledError,
     FinalizePackageLockedError,
     FinalizeUpstreamError,
     redactSecrets,

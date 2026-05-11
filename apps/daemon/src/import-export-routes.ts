@@ -1,5 +1,6 @@
 import type { Express } from 'express';
 import type { RouteDeps } from './server-context.js';
+import type { FinalizeClaudeCodeOptions } from './finalize-claude-code.js';
 
 export interface RegisterImportRoutesDeps extends RouteDeps<'db' | 'http' | 'uploads' | 'node' | 'ids' | 'paths' | 'imports' | 'auth' | 'projectStore' | 'conversations' | 'projectFiles'> {}
 
@@ -352,7 +353,14 @@ export function registerFinalizeRoutes(app: Express, ctx: RegisterFinalizeRoutes
   const { PROJECTS_DIR, DESIGN_SYSTEMS_DIR } = ctx.paths;
   const { getProject } = ctx.projectStore;
   const { isSafeId, validateExternalApiBaseUrl } = ctx.validation;
-  const { finalizeDesignPackage, FinalizePackageLockedError, FinalizeUpstreamError, redactSecrets } = ctx.finalize;
+  const {
+    finalizeDesignPackage,
+    finalizeDesignPackageWithClaudeCode,
+    FinalizeClaudeCodeNotInstalledError,
+    FinalizePackageLockedError,
+    FinalizeUpstreamError,
+    redactSecrets,
+  } = ctx.finalize;
   app.post('/api/projects/:id/finalize/anthropic', async (req, res) => {
     const { apiKey, baseUrl, model, maxTokens } = req.body || {};
     try {
@@ -455,6 +463,82 @@ export function registerFinalizeRoutes(app: Express, ctx: RegisterFinalizeRoutes
       // through redactSecrets defensively.
       console.error('[finalize/anthropic]', err);
       const safeMsg = redactSecrets(String(err?.message || err), [apiKey]);
+      return sendApiError(res, 500, 'INTERNAL_ERROR', safeMsg);
+    }
+  });
+
+  app.post('/api/projects/:id/finalize/claude-code', async (req, res) => {
+    const { model, maxTokens } = req.body || {};
+    try {
+      if (!isSafeId(req.params.id)) {
+        return sendApiError(res, 400, 'BAD_REQUEST', 'invalid project id');
+      }
+      if (model !== undefined && (typeof model !== 'string' || !model.trim())) {
+        return sendApiError(res, 400, 'BAD_REQUEST', 'model must be a non-empty string when provided');
+      }
+      if (maxTokens !== undefined && (typeof maxTokens !== 'number' || maxTokens <= 0)) {
+        return sendApiError(res, 400, 'BAD_REQUEST', 'maxTokens must be a positive number when provided');
+      }
+
+      const project = getProject(db, req.params.id);
+      if (!project) {
+        return sendApiError(res, 404, 'PROJECT_NOT_FOUND', 'project not found');
+      }
+
+      const finalizeAbort = new AbortController();
+      const abortFromRequest = (): void => {
+        if (!finalizeAbort.signal.aborted) finalizeAbort.abort();
+      };
+      res.on('close', abortFromRequest);
+
+      let result;
+      try {
+        const opts: FinalizeClaudeCodeOptions = {
+          signal: finalizeAbort.signal,
+        };
+        if (typeof model === 'string') opts.model = model;
+        if (typeof maxTokens === 'number') opts.maxTokens = maxTokens;
+        result = await finalizeDesignPackageWithClaudeCode(
+          db,
+          PROJECTS_DIR,
+          DESIGN_SYSTEMS_DIR,
+          req.params.id,
+          opts,
+        );
+      } finally {
+        res.off('close', abortFromRequest);
+      }
+      res.json(result);
+    } catch (err: any) {
+      if (err instanceof FinalizePackageLockedError) {
+        return sendApiError(res, 409, 'CONFLICT', err.message);
+      }
+      // CLI not installed (or not on PATH the daemon can see). The
+      // caller cannot recover from inside the request, so surface a
+      // pointer to the install / login steps via the standard
+      // UPSTREAM_UNAVAILABLE code (no dedicated NOT_INSTALLED code
+      // in the contracts ApiErrorCode union).
+      if (err instanceof FinalizeClaudeCodeNotInstalledError) {
+        return sendApiError(res, 503, 'UPSTREAM_UNAVAILABLE', err.message);
+      }
+      if (err instanceof FinalizeUpstreamError) {
+        const safeDetails = redactSecrets(err.rawText || '', []);
+        const init = safeDetails ? { details: safeDetails } : {};
+        if (err.status === 401) {
+          return sendApiError(res, 401, 'UNAUTHORIZED', err.message, init);
+        }
+        if (err.status === 429) {
+          return sendApiError(res, 429, 'RATE_LIMITED', err.message, init);
+        }
+        return sendApiError(res, 502, 'UPSTREAM_UNAVAILABLE', err.message, init);
+      }
+      const errName =
+        err && typeof err === 'object' && 'name' in err ? (err as { name?: unknown }).name : '';
+      if (errName === 'AbortError') {
+        return sendApiError(res, 503, 'UPSTREAM_UNAVAILABLE', 'finalize timed out');
+      }
+      console.error('[finalize/claude-code]', err);
+      const safeMsg = redactSecrets(String(err?.message || err), []);
       return sendApiError(res, 500, 'INTERNAL_ERROR', safeMsg);
     }
   });

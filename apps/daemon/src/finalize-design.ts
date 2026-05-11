@@ -31,6 +31,7 @@ import type {
   FinalizeAnthropicRequest,
   FinalizeAnthropicResponse,
   FinalizeArtifactRef,
+  FinalizeClaudeCodeResponse,
 } from '@open-design/contracts/api/finalize';
 import { getProject } from './db.js';
 import { readDesignSystem } from './design-systems.js';
@@ -51,6 +52,7 @@ export type {
   FinalizeAnthropicRequest,
   FinalizeAnthropicResponse,
   FinalizeArtifactRef,
+  FinalizeClaudeCodeResponse,
 };
 
 const DEFAULT_BASE_URL = 'https://api.anthropic.com';
@@ -213,13 +215,82 @@ export async function resolveCurrentArtifact(
   return null;
 }
 
-export async function finalizeDesignPackage(
+/**
+ * Result of a single upstream synthesis call. `inputTokens` and
+ * `outputTokens` are nullable so providers that do not surface usage
+ * (e.g. some Claude Code CLI versions) can report null without
+ * forcing a fabricated 0. `model` is the actual model the upstream
+ * reported back; providers that cannot determine the post-hoc model
+ * return null and callers fall back to whatever the request asked
+ * for.
+ */
+export interface FinalizeSynthesisResult {
+  designMd: string;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  model: string | null;
+}
+
+/**
+ * Pluggable upstream synthesis adapter. The orchestration assembles
+ * the prompts, opens the lockfile, bounds the call with a composed
+ * AbortSignal (caller signal + DEFAULT_TIMEOUT_MS), and writes
+ * DESIGN.md atomically. The synthesizer's only job is to take the
+ * prompts and return the synthesized Markdown body.
+ *
+ * Implementations should throw `FinalizeUpstreamError` for
+ * recoverable upstream failures (status-aware mapping in the route
+ * handler) and let `AbortError` propagate unchanged.
+ */
+export type FinalizeSynthesizer = (input: {
+  systemPrompt: string;
+  userPrompt: string;
+  signal: AbortSignal;
+}) => Promise<FinalizeSynthesisResult>;
+
+/**
+ * Options accepted by the shared orchestration. Providers extend
+ * this with their own credential/transport fields.
+ */
+export interface RunFinalizeOptions {
+  model?: string;
+  maxTokens?: number;
+  now?: () => Date;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+interface RunFinalizeResult {
+  designMdPath: string;
+  bytesWritten: number;
+  model: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  artifact: FinalizeArtifactRef | null;
+  transcriptMessageCount: number;
+  designSystemId: string | null;
+}
+
+/**
+ * Provider-agnostic finalize orchestration. Handles project lookup,
+ * lockfile, transcript export + truncation, design-system + artifact
+ * resolution, prompt build, abort/timeout composition, and the
+ * atomic DESIGN.md write. The actual upstream call is delegated to
+ * the supplied `synthesize` callback.
+ *
+ * Returns `model`/`inputTokens`/`outputTokens` as nullable so
+ * non-API-billed providers (Claude Code CLI) can faithfully report
+ * what their upstream surfaced; the Anthropic adapter narrows
+ * `model` back to a concrete string in `finalizeDesignPackage`.
+ */
+export async function runFinalizeWithSynthesizer(
   db: Db,
   projectsRoot: string,
   designSystemsRoot: string,
   projectId: string,
-  options: FinalizeOptions,
-): Promise<FinalizeAnthropicResponse> {
+  options: RunFinalizeOptions,
+  synthesize: FinalizeSynthesizer,
+): Promise<RunFinalizeResult> {
   const project = getProject(db, projectId);
   if (!project) {
     // Defensive — the route handler validates this and returns 404 before
@@ -245,8 +316,6 @@ export async function finalizeDesignPackage(
     `${OUTPUT_FILENAME}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`,
   );
   const now = options.now ?? (() => new Date());
-  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
-  const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
 
   let lockFd: number | null = null;
   try {
@@ -260,10 +329,40 @@ export async function finalizeDesignPackage(
     throw err;
   }
 
+  // Idempotent lockfile release. Both the abort listener and the
+  // outer `finally` call this; the first invocation flips `lockFd`
+  // to null so the second is a no-op. This lets us release the lock
+  // the instant a cancel arrives — important for the Claude Code
+  // CLI provider, where the subprocess can take a second or two to
+  // wind down after SIGTERM. Without eager release, a user who
+  // cancels and immediately retries hits 409 CONFLICT until the
+  // subprocess fully exits.
+  const releaseLock = (): void => {
+    if (lockFd === null) return;
+    const fd = lockFd;
+    lockFd = null;
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // ignore close-after-error
+    }
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      // lock may already be gone if disk vanished; not fatal
+    }
+  };
+
+  let abortReleaseListener: (() => void) | null = null;
+  if (options.signal) {
+    abortReleaseListener = releaseLock;
+    options.signal.addEventListener('abort', abortReleaseListener, { once: true });
+  }
+
   try {
     // Phase 3: export transcript via the PR #493 primitive. Returns the
     // disk path; we read the body and run it through the truncation
-    // policy so a 4 MB transcript does not blow Anthropic's context.
+    // policy so a 4 MB transcript does not blow the synthesis context.
     const transcriptResult = exportProjectTranscript(db, projectsRoot, projectId, { now });
     const transcriptJsonl = fs.readFileSync(transcriptResult.path, 'utf8');
     const truncatedJsonl = truncateTranscriptForPrompt(transcriptJsonl);
@@ -300,78 +399,29 @@ export async function finalizeDesignPackage(
       now: now(),
     });
 
-    // Phase 7: Anthropic call with bounded blocking timeout. The timeout
+    // Phase 7: upstream synthesis with bounded blocking timeout. The timeout
     // controller is always created so DEFAULT_TIMEOUT_MS bounds every call,
     // regardless of whether the caller supplied a request-abort signal.
     // When the caller does pass a signal, both cancel paths are honored via
     // AbortSignal.any so neither replaces the other (per @lefarcen P1 review
     // on PR #974 round 7: passing options.signal alone disabled the timeout).
-    //
-    // Network errors (DNS, ECONNREFUSED, ECONNRESET) and JSON parse errors
-    // on the response body are rewrapped as FinalizeUpstreamError(502) so
-    // the route handler maps them to 502 UPSTREAM_FAILED rather than 500
-    // INTERNAL. Per @lefarcen P1 review on PR #832: only HTTP-non-OK
-    // responses were previously wrapped, leaving DNS/parse failures to
-    // surface as generic 500s.
     const timeoutController = new AbortController();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const timeoutId = setTimeout(() => timeoutController.abort(), timeoutMs);
-    let response: Response;
+    let synthesis: FinalizeSynthesisResult;
     try {
-      const callParams: AnthropicCallParams = {
-        apiKey: options.apiKey,
-        baseUrl,
-        model: options.model,
-        maxTokens,
-        systemPrompt,
-        userPrompt,
-      };
-      callParams.signal = options.signal
+      const composedSignal = options.signal
         ? AbortSignal.any([options.signal, timeoutController.signal])
         : timeoutController.signal;
-      if (options.fetchImpl) callParams.fetchImpl = options.fetchImpl;
-      try {
-        response = await callAnthropicWithRetry(callParams);
-      } catch (err: unknown) {
-        if (err instanceof FinalizeUpstreamError) throw err;
-        const errName =
-          err && typeof err === 'object' && 'name' in err
-            ? (err as { name?: unknown }).name
-            : '';
-        if (errName === 'AbortError') throw err; // route handler maps to 503
-        // Network-level failure (TypeError from fetch, ENOTFOUND/ECONNREFUSED
-        // via cause.code, etc.) — rewrap as upstream failure so the route
-        // handler maps to 502 UPSTREAM_FAILED with redacted details.
-        const message = err instanceof Error ? err.message : String(err);
-        throw new FinalizeUpstreamError(502, '', `upstream network error: ${message}`);
-      }
+      synthesis = await synthesize({ systemPrompt, userPrompt, signal: composedSignal });
     } finally {
       clearTimeout(timeoutId);
     }
 
-    // Phase 8: extract DESIGN.md body and usage counters. A 200 with a body
-    // that isn't valid JSON (or isn't an object) is treated as an upstream
-    // failure rather than letting JSON.parse's SyntaxError surface as 500.
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new FinalizeUpstreamError(
-        502,
-        '',
-        `upstream Anthropic returned non-JSON body: ${message}`,
-      );
-    }
-    const designMd = extractDesignMd(payload);
-    const usage = (payload as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
-    const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
-    const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
-
     // Phase 9: atomic write. Mirror PR #493: writeFileSync({flag:'wx'}) →
     // reopen for fsync → rename. On any failure unlink tmp; rethrow so the
     // route handler maps the error.
-    const encoded = Buffer.from(designMd, 'utf8');
+    const encoded = Buffer.from(synthesis.designMd, 'utf8');
     try {
       fs.writeFileSync(tmpPath, encoded, { flag: 'wx' });
       const fsyncFd = fs.openSync(tmpPath, 'r+');
@@ -393,9 +443,9 @@ export async function finalizeDesignPackage(
     return {
       designMdPath: finalPath,
       bytesWritten: encoded.length,
-      model: options.model,
-      inputTokens,
-      outputTokens,
+      model: synthesis.model ?? options.model ?? null,
+      inputTokens: synthesis.inputTokens,
+      outputTokens: synthesis.outputTokens,
       artifact: artifact
         ? {
             name: artifact.name,
@@ -409,19 +459,102 @@ export async function finalizeDesignPackage(
       designSystemId,
     };
   } finally {
-    if (lockFd !== null) {
-      try {
-        fs.closeSync(lockFd);
-      } catch {
-        // ignore close-after-error
-      }
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        // lock may already be gone if disk vanished; not fatal
-      }
+    if (abortReleaseListener && options.signal) {
+      options.signal.removeEventListener('abort', abortReleaseListener);
     }
+    releaseLock();
   }
+}
+
+export async function finalizeDesignPackage(
+  db: Db,
+  projectsRoot: string,
+  designSystemsRoot: string,
+  projectId: string,
+  options: FinalizeOptions,
+): Promise<FinalizeAnthropicResponse> {
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
+
+  const synthesize: FinalizeSynthesizer = async ({ systemPrompt, userPrompt, signal }) => {
+    // Network errors (DNS, ECONNREFUSED, ECONNRESET) and JSON parse errors
+    // on the response body are rewrapped as FinalizeUpstreamError(502) so
+    // the route handler maps them to 502 UPSTREAM_FAILED rather than 500
+    // INTERNAL. Per @lefarcen P1 review on PR #832: only HTTP-non-OK
+    // responses were previously wrapped, leaving DNS/parse failures to
+    // surface as generic 500s.
+    let response: Response;
+    try {
+      const callParams: AnthropicCallParams = {
+        apiKey: options.apiKey,
+        baseUrl,
+        model: options.model,
+        maxTokens,
+        systemPrompt,
+        userPrompt,
+        signal,
+      };
+      if (options.fetchImpl) callParams.fetchImpl = options.fetchImpl;
+      response = await callAnthropicWithRetry(callParams);
+    } catch (err: unknown) {
+      if (err instanceof FinalizeUpstreamError) throw err;
+      const errName =
+        err && typeof err === 'object' && 'name' in err
+          ? (err as { name?: unknown }).name
+          : '';
+      if (errName === 'AbortError') throw err; // route handler maps to 503
+      const message = err instanceof Error ? err.message : String(err);
+      throw new FinalizeUpstreamError(502, '', `upstream network error: ${message}`);
+    }
+
+    // A 200 with a body that isn't valid JSON (or isn't an object) is
+    // treated as an upstream failure rather than letting JSON.parse's
+    // SyntaxError surface as 500.
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new FinalizeUpstreamError(
+        502,
+        '',
+        `upstream Anthropic returned non-JSON body: ${message}`,
+      );
+    }
+    const designMd = extractDesignMd(payload);
+    const usage = (payload as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
+    const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+    const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
+    return { designMd, inputTokens, outputTokens, model: options.model };
+  };
+
+  const runOptions: RunFinalizeOptions = { model: options.model };
+  if (options.maxTokens !== undefined) runOptions.maxTokens = options.maxTokens;
+  if (options.now !== undefined) runOptions.now = options.now;
+  if (options.signal !== undefined) runOptions.signal = options.signal;
+  if (options.timeoutMs !== undefined) runOptions.timeoutMs = options.timeoutMs;
+  const result = await runFinalizeWithSynthesizer(
+    db,
+    projectsRoot,
+    designSystemsRoot,
+    projectId,
+    runOptions,
+    synthesize,
+  );
+
+  // The Anthropic API path always knows its model and surfaces usage
+  // counters, so narrow the nullable shared shape back to the
+  // existing concrete response contract.
+  return {
+    designMdPath: result.designMdPath,
+    bytesWritten: result.bytesWritten,
+    model: result.model ?? options.model,
+    inputTokens: result.inputTokens ?? 0,
+    outputTokens: result.outputTokens ?? 0,
+    artifact: result.artifact,
+    transcriptMessageCount: result.transcriptMessageCount,
+    designSystemId: result.designSystemId,
+  };
 }
 
 /**

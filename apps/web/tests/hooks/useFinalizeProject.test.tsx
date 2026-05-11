@@ -9,6 +9,7 @@ import {
 } from '../../src/hooks/useFinalizeProject';
 
 const REQUEST = {
+  provider: 'anthropic' as const,
   apiKey: 'sk-test',
   baseUrl: 'https://api.anthropic.com',
   model: 'claude-opus-4-7',
@@ -56,11 +57,57 @@ describe('useFinalizeProject', () => {
     const [url, init] = fetchSpy.mock.calls[0]!;
     expect(url).toBe('/api/projects/p1/finalize/anthropic');
     const sent = JSON.parse((init as RequestInit).body as string);
-    expect(sent).toEqual(REQUEST);
+    // The `provider` discriminant selects the URL and is stripped
+    // from the body before POST so the daemon's request DTO stays
+    // free of UI-internal routing fields.
+    const { provider: _provider, ...expectedBody } = REQUEST;
+    expect(sent).toEqual(expectedBody);
     expect((init as RequestInit).method).toBe('POST');
     expect((init as RequestInit).headers).toMatchObject({
       'Content-Type': 'application/json',
     });
+  });
+
+  it('routes the claude-code provider to /finalize/claude-code without sending an apiKey', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(jsonResponse(SUCCESS_BODY));
+    const { result } = renderHook(() => useFinalizeProject('p1'));
+
+    await act(async () => {
+      await result.current.trigger({
+        provider: 'claude-code',
+        model: 'claude-opus-4-7',
+        maxTokens: 8192,
+      });
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe('/api/projects/p1/finalize/claude-code');
+    const sent = JSON.parse((init as RequestInit).body as string);
+    expect(sent).toEqual({ model: 'claude-opus-4-7', maxTokens: 8192 });
+    // The CLI route never receives an apiKey — its auth is the
+    // user's existing `claude /login` session.
+    expect(sent).not.toHaveProperty('apiKey');
+  });
+
+  it('emits a CLI-tailored UNAUTHORIZED message when /claude-code returns 401', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse(
+        { error: { code: 'UNAUTHORIZED', message: 'not signed in' } },
+        401,
+      ),
+    );
+    const { result } = renderHook(() => useFinalizeProject('p1'));
+
+    await act(async () => {
+      await result.current.trigger({ provider: 'claude-code' });
+    });
+
+    await waitFor(() => expect(result.current.status).toBe('error'));
+    expect(result.current.error?.code).toBe('UNAUTHORIZED');
+    expect(result.current.error?.message).toMatch(/claude \/login/i);
   });
 
   const ERROR_TABLE: Array<{ code: string; expected: string }> = [
