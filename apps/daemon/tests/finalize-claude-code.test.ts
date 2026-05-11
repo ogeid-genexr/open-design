@@ -16,7 +16,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   callClaudeCodeCLI,
-  CLAUDE_CODE_BUILTIN_TOOLS,
+  CLAUDE_CODE_EMPTY_TOOL_ALLOWLIST,
   FinalizeClaudeCodeNotInstalledError,
   probeClaudeCodeCli,
 } from '../src/finalize-claude-code.js';
@@ -151,7 +151,7 @@ describe('callClaudeCodeCLI', () => {
     expect(capturedArgs).toContain('claude-opus-4-7');
   });
 
-  it('passes --disallowedTools listing every built-in tool so synthesis runs cannot touch the project cwd', async () => {
+  it('passes --allowedTools with an empty value so synthesis runs cannot launch any tool', async () => {
     let capturedArgs: readonly string[] = [];
     const spawnImpl = makeSpawn((_cmd, args) => {
       capturedArgs = args;
@@ -175,18 +175,15 @@ describe('callClaudeCodeCLI', () => {
       transport: { spawnImpl: spawnImpl as any },
     });
 
-    const flagIdx = capturedArgs.indexOf('--disallowedTools');
+    const flagIdx = capturedArgs.indexOf('--allowedTools');
     expect(flagIdx).toBeGreaterThanOrEqual(0);
-    const denyList = String(capturedArgs[flagIdx + 1] ?? '').split(/\s+/);
-    for (const tool of CLAUDE_CODE_BUILTIN_TOOLS) {
-      expect(denyList).toContain(tool);
-    }
-    // High-risk tools must be in the deny list specifically — these
-    // are the ones whose absence would let synthesis mutate the
-    // user's project from cwd.
-    for (const dangerous of ['Bash', 'Edit', 'Write', 'Read', 'WebFetch']) {
-      expect(denyList).toContain(dangerous);
-    }
+    expect(capturedArgs[flagIdx + 1]).toBe(CLAUDE_CODE_EMPTY_TOOL_ALLOWLIST);
+    expect(capturedArgs[flagIdx + 1]).toBe('');
+    // An empty allowlist is the contract: no enumerated denylist
+    // should be present, since the whole point of switching away from
+    // `--disallowedTools` is that hand-maintained denylists leak any
+    // tool we forget to name (installed built-ins, MCP tools, etc.).
+    expect(capturedArgs).not.toContain('--disallowedTools');
   });
 
   it('threads maxTokens into the child env as CLAUDE_CODE_MAX_OUTPUT_TOKENS', async () => {
