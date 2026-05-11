@@ -243,7 +243,9 @@ export function messageForCode(
     case 'INTERNAL_ERROR':
       return 'Something went wrong while finalizing. Check the daemon logs.';
     case 'TIMEOUT':
-      return 'Finalize timed out after 130 s. The daemon may still be running.';
+      return provider === 'claude-code'
+        ? 'Finalize timed out after 630 s. The daemon may still be running.'
+        : 'Finalize timed out after 130 s. The daemon may still be running.';
     case 'NETWORK_ERROR':
     default:
       return "Couldn't reach the daemon. Make sure it's running.";
