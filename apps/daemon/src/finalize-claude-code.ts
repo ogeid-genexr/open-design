@@ -33,6 +33,7 @@ import {
   type FinalizeSynthesizer,
   type RunFinalizeOptions,
 } from './finalize-design.js';
+import { spawnEnvForAgent } from './runtimes/env.js';
 
 export type { FinalizeClaudeCodeResponse };
 
@@ -285,7 +286,13 @@ export async function callClaudeCodeCLI(input: {
   // CLI flag). Honoring `maxTokens` here keeps the route's request
   // contract truthful: a caller that asks for a tighter ceiling
   // actually gets one, matching the Anthropic provider's behavior.
-  const childEnv = { ...process.env };
+  // Use the same env shaping as the claude agent runtime path: strip
+  // ANTHROPIC_API_KEY so Claude Code falls back to its own subscription
+  // auth (claude /login, Max/Pro plan) instead of silently API-billing
+  // a daemon that happens to have the key exported. This is the billing
+  // boundary the whole provider exists to preserve. Honors the
+  // ANTHROPIC_BASE_URL escape hatch (custom proxy).
+  const childEnv = spawnEnvForAgent('claude', process.env);
   if (typeof input.maxTokens === 'number' && input.maxTokens > 0) {
     childEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(Math.trunc(input.maxTokens));
   }

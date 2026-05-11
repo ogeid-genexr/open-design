@@ -38,6 +38,7 @@ describe('POST /api/projects/:id/finalize/claude-code', () => {
   const PROJECT_ID_OK = 'fcc-route-ok';
   const PROJECT_ID_AUTH = 'fcc-route-auth';
   const PROJECT_ID_MISSING = 'fcc-route-missing';
+  const PROJECT_ID_ENV = 'fcc-route-env';
 
   const SUCCESS_DESIGN_MD = '# DESIGN.md\n## Summary\nfrom fake CLI\n';
 
@@ -56,6 +57,14 @@ if (args[0] === '--version') {
 }
 const mode = process.env.OD_FAKE_CLAUDE_MODE || 'success';
 const successBody = process.env.OD_FAKE_CLAUDE_BODY || '';
+const envDumpPath = process.env.OD_FAKE_CLAUDE_ENV_DUMP;
+if (envDumpPath) {
+  const fs = require('node:fs');
+  fs.writeFileSync(envDumpPath, JSON.stringify({
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? null,
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS ?? null,
+  }));
+}
 if (mode === 'success') {
   const event = {
     type: 'result',
@@ -95,7 +104,7 @@ process.exit(2);
     const dataDir = process.env.OD_DATA_DIR;
     if (!dataDir) throw new Error('OD_DATA_DIR is required for daemon route tests');
 
-    for (const id of [PROJECT_ID_OK, PROJECT_ID_AUTH, PROJECT_ID_MISSING]) {
+    for (const id of [PROJECT_ID_OK, PROJECT_ID_AUTH, PROJECT_ID_MISSING, PROJECT_ID_ENV]) {
       await fetch(`${baseUrl}/api/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -207,6 +216,39 @@ process.exit(2);
       },
     );
     expect(res.status).toBe(400);
+  });
+
+  it('strips ANTHROPIC_API_KEY from the spawn env so Max plan auth wins', async () => {
+    // Regression: the provider exists to let Max plan users finalize via
+    // their subscription. If ANTHROPIC_API_KEY leaks through to the
+    // child, Claude Code picks API-key billing over the user's
+    // `claude /login` credentials, defeating the whole feature.
+    process.env.OD_FAKE_CLAUDE_MODE = 'success';
+    const envDumpPath = path.join(fakeBinDir, 'env-dump.json');
+    process.env.OD_FAKE_CLAUDE_ENV_DUMP = envDumpPath;
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-should-not-leak';
+    try {
+      const res = await fetch(
+        `${baseUrl}/api/projects/${PROJECT_ID_ENV}/finalize/claude-code`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ maxTokens: 1234 }),
+        },
+      );
+      expect(res.status).toBe(200);
+      const dumped = JSON.parse(readFileSync(envDumpPath, 'utf8')) as {
+        ANTHROPIC_API_KEY: string | null;
+        CLAUDE_CODE_MAX_OUTPUT_TOKENS: string | null;
+      };
+      expect(dumped.ANTHROPIC_API_KEY).toBeNull();
+      expect(dumped.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('1234');
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prevKey;
+      delete process.env.OD_FAKE_CLAUDE_ENV_DUMP;
+    }
   });
 
   it('returns 404 for unknown project id', async () => {
