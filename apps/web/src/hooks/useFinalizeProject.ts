@@ -1,4 +1,4 @@
-// Wraps POST /api/projects/:id/finalize/anthropic for the Finalize
+// Wraps POST /api/projects/:id/finalize/<provider> for the Finalize
 // design package button (#451). The daemon route runs synchronously for
 // 60–120 s, so the hook owns:
 //   - request lifecycle (idle / pending / success / error)
@@ -8,20 +8,40 @@
 //     response is non-OK, body.error.{code,message,details} is the
 //     authoritative payload. The mapping table below produces the
 //     user-facing toast string for each `code`. `details`, when present,
-//     is rendered as a secondary toast line so the upstream Anthropic
-//     reason (e.g. account usage cap) is visible to the user instead of
-//     just the daemon's category label (#450 verification commitment).
+//     is rendered as a secondary toast line so the upstream provider's
+//     reason (e.g. account usage cap, missing CLI login) is visible to
+//     the user instead of just the daemon's category label.
+//
+// The hook is provider-aware via a tagged request union. `anthropic`
+// hits the BYOK API route (#832); `claude-code` hits the local CLI
+// route (#963) which Max plan subscribers prefer because it inherits
+// their subscription's subsidized billing. The caller chooses which
+// based on the user's AppConfig (mode + agentId) — the hook does not
+// pick a default of its own.
 
 import { useCallback, useRef, useState } from 'react';
 import type {
   ApiErrorCode,
   FinalizeAnthropicRequest,
   FinalizeAnthropicResponse,
+  FinalizeClaudeCodeRequest,
+  FinalizeClaudeCodeResponse,
 } from '@open-design/contracts';
 
-// 130 000 ms = daemon timeout (120 s) + 10 s buffer so the daemon's
-// own retry/timeout layer always wins under normal failure modes.
-const FETCH_TIMEOUT_MS = 130_000;
+// Per-provider client-side fetch ceiling. Each value is the daemon's
+// own upstream-call ceiling for that provider plus a small buffer so
+// the daemon's status-aware error mapping always wins under normal
+// failure modes (the client only times out when the daemon has gone
+// silent past its own ceiling, which signals a real disconnect rather
+// than a slow upstream).
+//   - anthropic:   daemon 120 s + 10 s buffer
+//   - claude-code: daemon 600 s + 30 s buffer (CLI synthesis is
+//                  meaningfully slower than a direct API call —
+//                  subprocess overhead, streaming, internal retries)
+const FETCH_TIMEOUT_BY_PROVIDER: Record<FinalizeProvider, number> = {
+  anthropic: 130_000,
+  'claude-code': 630_000,
+};
 
 export type FinalizeStatus = 'idle' | 'pending' | 'success' | 'error';
 
@@ -31,11 +51,32 @@ export interface FinalizeError {
   details: string | null;
 }
 
+export type FinalizeProvider = 'anthropic' | 'claude-code';
+
+/**
+ * Tagged-union request type. The discriminant selects the daemon
+ * route; the rest of the body is sent verbatim per the route's
+ * contract (anthropic: BYOK API key + model; claude-code: optional
+ * model only, CLI handles auth).
+ */
+export type FinalizeRequest =
+  | ({ provider: 'anthropic' } & FinalizeAnthropicRequest)
+  | ({ provider: 'claude-code' } & FinalizeClaudeCodeRequest);
+
+/**
+ * Provider-agnostic success response. The Anthropic route's fields
+ * are a strict subset of the Claude Code route's (the latter
+ * widens model/inputTokens/outputTokens to nullable), so this
+ * widened shape is safe to use for both. UI consumers that read
+ * token counts must accept nullable.
+ */
+export type FinalizeResponse = FinalizeClaudeCodeResponse;
+
 export interface FinalizeProjectState {
   status: FinalizeStatus;
   error: FinalizeError | null;
-  result: FinalizeAnthropicResponse | null;
-  trigger: (req: FinalizeAnthropicRequest) => Promise<FinalizeAnthropicResponse | null>;
+  result: FinalizeResponse | null;
+  trigger: (req: FinalizeRequest) => Promise<FinalizeResponse | null>;
   cancel: () => void;
 }
 
@@ -50,7 +91,7 @@ interface DaemonErrorEnvelope {
 export function useFinalizeProject(projectId: string): FinalizeProjectState {
   const [status, setStatus] = useState<FinalizeStatus>('idle');
   const [error, setError] = useState<FinalizeError | null>(null);
-  const [result, setResult] = useState<FinalizeAnthropicResponse | null>(null);
+  const [result, setResult] = useState<FinalizeResponse | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   // Tracks whether the in-flight controller's abort came from the
   // 130 s timeout (true) or the user clicking Cancel (false). The
@@ -63,7 +104,7 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
   }, []);
 
   const trigger = useCallback(
-    async (req: FinalizeAnthropicRequest): Promise<FinalizeAnthropicResponse | null> => {
+    async (req: FinalizeRequest): Promise<FinalizeResponse | null> => {
       // Cancel any in-flight call before starting a new one so a
       // double-clicked button doesn't pile up two daemon requests.
       abortRef.current?.abort();
@@ -73,7 +114,7 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
       const timeoutId = setTimeout(() => {
         timedOutRef.current = true;
         controller.abort();
-      }, FETCH_TIMEOUT_MS);
+      }, FETCH_TIMEOUT_BY_PROVIDER[req.provider]);
 
       setStatus('pending');
       setError(null);
@@ -88,12 +129,13 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
       const isCurrent = () => abortRef.current === controller;
 
       try {
+        const { provider, ...payload } = req;
         const resp = await fetch(
-          `/api/projects/${encodeURIComponent(projectId)}/finalize/anthropic`,
+          `/api/projects/${encodeURIComponent(projectId)}/finalize/${provider}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(req),
+            body: JSON.stringify(payload),
             signal: controller.signal,
           },
         );
@@ -106,7 +148,7 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
           const details = typeof detailsRaw === 'string' ? detailsRaw : null;
           const finalizeError: FinalizeError = {
             code: code as FinalizeError['code'],
-            message: messageForCode(code as ApiErrorCode),
+            message: messageForCode(code as ApiErrorCode, req.provider),
             details,
           };
           setError(finalizeError);
@@ -114,7 +156,11 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
           return null;
         }
 
-        const body = (await resp.json()) as FinalizeAnthropicResponse;
+        const raw = (await resp.json()) as FinalizeAnthropicResponse | FinalizeClaudeCodeResponse;
+        // Widen the Anthropic response (concrete model + tokens) to
+        // the union shape stored in state. The fields are guaranteed
+        // populated for the Anthropic route, so the cast is safe.
+        const body: FinalizeResponse = raw as FinalizeResponse;
         if (!isCurrent()) return null;
         setResult(body);
         setStatus('success');
@@ -131,7 +177,7 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
             // synthesis, so the message names that explicitly.
             const finalizeError: FinalizeError = {
               code: 'TIMEOUT',
-              message: messageForCode('TIMEOUT'),
+              message: messageForCode('TIMEOUT', req.provider),
               details: null,
             };
             setError(finalizeError);
@@ -145,7 +191,7 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
         }
         const finalizeError: FinalizeError = {
           code: 'NETWORK_ERROR',
-          message: messageForCode('NETWORK_ERROR'),
+          message: messageForCode('NETWORK_ERROR', req.provider),
           details: err instanceof Error ? err.message : String(err),
         };
         setError(finalizeError);
@@ -164,19 +210,32 @@ export function useFinalizeProject(projectId: string): FinalizeProjectState {
 
 // User-facing toast strings for each daemon error code. The unknown /
 // network branch covers transport errors and codes the daemon adds in
-// future without crashing the UI.
-export function messageForCode(code: ApiErrorCode | 'NETWORK_ERROR' | string): string {
+// future without crashing the UI. `provider` tailors three codes whose
+// remediation differs by route (UNAUTHORIZED, RATE_LIMITED,
+// UPSTREAM_UNAVAILABLE); the rest are provider-neutral.
+export function messageForCode(
+  code: ApiErrorCode | 'NETWORK_ERROR' | string,
+  provider: FinalizeProvider = 'anthropic',
+): string {
   switch (code) {
     case 'BAD_REQUEST':
-      return 'Bad request — check the API key and model.';
+      return provider === 'claude-code'
+        ? 'Bad request — check the model name.'
+        : 'Bad request — check the API key and model.';
     case 'UNAUTHORIZED':
-      return 'API key was rejected. Check it in Settings.';
+      return provider === 'claude-code'
+        ? 'Claude Code CLI is not signed in. Run `claude /login` in a terminal.'
+        : 'API key was rejected. Check it in Settings.';
     case 'FORBIDDEN':
       return 'Access denied by the upstream API.';
     case 'RATE_LIMITED':
-      return 'Anthropic rate-limited the request. Try again in a minute.';
+      return provider === 'claude-code'
+        ? 'Claude Code rate-limited the request. Try again in a minute.'
+        : 'Anthropic rate-limited the request. Try again in a minute.';
     case 'UPSTREAM_UNAVAILABLE':
-      return 'The Anthropic API is unavailable right now.';
+      return provider === 'claude-code'
+        ? 'Claude Code CLI is unavailable. Make sure `claude` is installed and on PATH.'
+        : 'The Anthropic API is unavailable right now.';
     case 'CONFLICT':
       return 'Another finalize is in progress for this project.';
     case 'PROJECT_NOT_FOUND':

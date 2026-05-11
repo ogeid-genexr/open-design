@@ -30,6 +30,7 @@ import {
   FinalizePackageLockedError,
   FinalizeUpstreamError,
   resolveCurrentArtifact,
+  runFinalizeWithSynthesizer,
   truncateTranscriptForPrompt,
 } from '../src/finalize-design.js';
 
@@ -975,5 +976,152 @@ describe('isSafeId — path-traversal regression', () => {
     expect(isSafeId('818cf7a8-8399-4220-a507-07802d8842a8')).toBe(true);
     expect(isSafeId('a')).toBe(true);
     expect(isSafeId('a.b.c')).toBe(true); // mixed-content with dots is fine
+  });
+});
+
+describe('runFinalizeWithSynthesizer (eager-release-on-abort)', () => {
+  // Verifies the abort-listener path added for #963: when the
+  // caller's AbortSignal fires while the synthesizer is still
+  // running, the lockfile is released immediately so a retry that
+  // arrives before the synthesizer has wound down can take the
+  // lock. Without this, a Claude Code CLI subprocess that takes a
+  // second to exit after SIGTERM keeps the lock held and the user's
+  // retry gets 409 CONFLICT.
+  let tempDir: string;
+  const PROJECT_ID = 'eager-release-fixture';
+
+  afterEach(() => {
+    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function setupPipeline() {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'od-eager-release-'));
+    const designSystemsRoot = path.join(tempDir, 'design-systems');
+    fs.mkdirSync(designSystemsRoot, { recursive: true });
+    const db = openDatabase(tempDir);
+    insertProject(db, {
+      id: PROJECT_ID,
+      name: 'p',
+      designSystemId: null,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const projectsRoot = path.join(tempDir, 'projects');
+    fs.mkdirSync(path.join(projectsRoot, PROJECT_ID), { recursive: true });
+    insertConversation(db, {
+      id: 'c1',
+      projectId: PROJECT_ID,
+      title: 't',
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    upsertMessage(db, 'c1', {
+      id: 'm1',
+      role: 'user',
+      content: '',
+      events: [{ kind: 'text', text: 'hi' }],
+    });
+    return { db, projectsRoot, designSystemsRoot };
+  }
+
+  it('releases the lockfile the moment the signal aborts, without waiting for the synthesizer to settle', async () => {
+    const { db, projectsRoot, designSystemsRoot } = setupPipeline();
+    const lockPath = path.join(projectsRoot, PROJECT_ID, '.finalize.lock');
+    const controller = new AbortController();
+
+    // Synthesizer that never resolves on its own — only the abort
+    // listener can break the call. We assert the lock disappears
+    // BEFORE we let the synthesizer reject, proving the eager
+    // release runs without waiting for the upstream to wind down.
+    let lockGoneWhenAborted = false;
+    const pending = runFinalizeWithSynthesizer(
+      db,
+      projectsRoot,
+      designSystemsRoot,
+      PROJECT_ID,
+      { signal: controller.signal, timeoutMs: 60_000 },
+      ({ signal }) =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              // Snapshot lock state at the exact moment the inner
+              // synthesizer sees the abort. The eager-release
+              // listener is registered earlier, so it should have
+              // already fired by now.
+              lockGoneWhenAborted = !fs.existsSync(lockPath);
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              reject(err);
+            },
+            { once: true },
+          );
+        }),
+    );
+
+    // Wait until the orchestrator has reached the synthesizer
+    // (lock + listener registered + composed signal handed off).
+    await new Promise((r) => setTimeout(r, 50));
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    controller.abort();
+    await expect(pending).rejects.toThrow(/aborted/);
+    expect(lockGoneWhenAborted).toBe(true);
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it('allows a second finalize to take the lock immediately after the first is aborted', async () => {
+    const { db, projectsRoot, designSystemsRoot } = setupPipeline();
+    const lockPath = path.join(projectsRoot, PROJECT_ID, '.finalize.lock');
+    const controller = new AbortController();
+
+    const first = runFinalizeWithSynthesizer(
+      db,
+      projectsRoot,
+      designSystemsRoot,
+      PROJECT_ID,
+      { signal: controller.signal, timeoutMs: 60_000 },
+      ({ signal }) =>
+        new Promise<never>((_resolve, reject) => {
+          signal.addEventListener('abort', () => {
+            // Simulate a CLI subprocess that lingers for 100 ms
+            // after SIGTERM — long enough that a retry attempted in
+            // that window would observe the lockfile if the
+            // orchestrator waited for the synthesizer to settle.
+            setTimeout(() => {
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              reject(err);
+            }, 100);
+          });
+        }),
+    );
+
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    // Lock should be gone the instant abort fires, before the
+    // synthesizer settles.
+    expect(fs.existsSync(lockPath)).toBe(false);
+
+    // A retry can take the lock immediately and complete normally.
+    const second = await runFinalizeWithSynthesizer(
+      db,
+      projectsRoot,
+      designSystemsRoot,
+      PROJECT_ID,
+      { timeoutMs: 60_000 },
+      async () => ({
+        designMd: '# DESIGN.md\nretry-ok\n',
+        inputTokens: 0,
+        outputTokens: 0,
+        model: null,
+      }),
+    );
+    expect(second.bytesWritten).toBeGreaterThan(0);
+    expect(fs.readFileSync(second.designMdPath, 'utf8')).toBe(
+      '# DESIGN.md\nretry-ok\n',
+    );
+
+    await expect(first).rejects.toThrow(/aborted/);
   });
 });

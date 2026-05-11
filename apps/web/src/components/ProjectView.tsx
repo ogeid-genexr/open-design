@@ -1958,12 +1958,27 @@ export function ProjectView({
   // shortcut wiring. Close to the JSX so the data flow is easy to
   // trace from the toolbar back to its sources.
   const handleFinalize = useCallback(() => {
-    void finalize.trigger({
-      apiKey: config.apiKey,
-      baseUrl: config.baseUrl,
-      model: config.model,
-      maxTokens: effectiveMaxTokens(config),
-    }).then((result) => {
+    // Route to the Claude Code CLI sibling endpoint (#963) when the
+    // user has the local Claude Code agent selected; this inherits
+    // their Max plan subscription so they do not pay per-token API
+    // costs on top. Every other configuration (BYOK API mode, or
+    // daemon mode with a non-claude agent) falls through to the
+    // Anthropic API route (#832), which still requires a BYOK key.
+    const useClaudeCode = config.mode === 'daemon' && config.agentId === 'claude';
+    const trigger = useClaudeCode
+      ? finalize.trigger({
+          provider: 'claude-code',
+          model: config.model,
+          maxTokens: effectiveMaxTokens(config),
+        })
+      : finalize.trigger({
+          provider: 'anthropic',
+          apiKey: config.apiKey,
+          baseUrl: config.baseUrl,
+          model: config.model,
+          maxTokens: effectiveMaxTokens(config),
+        });
+    void trigger.then((result) => {
       if (result) void designMdState.refresh();
     });
   }, [finalize, config, designMdState]);
